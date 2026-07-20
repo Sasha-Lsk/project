@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg_root">#0E1116</color>
+    <color name="bg_bar">#161B22</color>
+    <color name="bg_bar_dark">#0B0E13</color>
+    <color name="bg_card">#161B22</color>
+    <color name="bg_field">#1C222B</color>
+    <color name="bg_log">#080B10</color>
+    <color name="divider">#232A33</color>
+
+    <color name="accent">#1E88FF</color>
+    <color name="accent_dark">#1565C0</color>
+    <color name="green">#2EA043</color>
+    <color name="green_dark">#1B6E2E</color>
+    <color name="orange">#D29922</color>
+    <color name="orange_dark">#9E6F13</color>
+    <color name="purple">#8957E5</color>
+    <color name="purple_dark">#6B40BF</color>
+
+    <color name="text_primary">#E6EDF3</color>
+    <color name="text_secondary">#8B949E</color>
+    <color name="text_hint">#5B6570</color>
+    <color name="white">#FFFFFF</color>
+
+    <color name="log_info">#8B949E</color>
+    <color name="log_ok">#3FB950</color>
+    <color name="log_err">#F85149</color>
+    <color name="log_warn">#D29922</color>
+    <color name="log_cmd">#58A6FF</color>
+</resources>
