@@ -126,6 +126,14 @@ public class ProjectBuilder {
      * (align+sign делает вызывающая сторона).
      */
     public File buildUnsigned(File proj, File workDir, File unsignedOut, boolean bumpTarget) throws Exception {
+        return buildUnsigned(proj, workDir, unsignedOut, bumpTarget, null);
+    }
+
+    /**
+     * @param sourceApk оригинальный APK (может быть null) — источник настоящего
+     *                  targetSdkVersion, если jadx его потерял в манифесте.
+     */
+    public File buildUnsigned(File proj, File workDir, File unsignedOut, boolean bumpTarget, File sourceApk) throws Exception {
         Layout L = detect(proj);
         if (L.manifest == null)
             throw new Exception("Не найден AndroidManifest.xml в проекте");
@@ -146,12 +154,14 @@ public class ProjectBuilder {
         File dexDir      = new File(workDir, "dex");     dexDir.mkdirs();       // classes.dex
         File baseApk     = new File(workDir, "base.apk");
 
-        File manifestForLink = L.manifest;
-        if (bumpTarget) {
-            manifestForLink = new File(workDir, "AndroidManifest.xml");
-            copy(L.manifest, manifestForLink);
-            bumpManifest(manifestForLink);
-        }
+        // ВСЕГДА нормализуем targetSdkVersion в рабочей копии манифеста (не в
+        // оригинале проекта): нужно, чтобы приложение вело себя как оригинал и
+        // при этом не показывало окно «для старой версии» на новых Android.
+        // (флаг bumpTarget оставлен для совместимости, но нормализация нужна
+        // всегда — иначе jadx-манифест без targetSdk даёт target=minSdk.)
+        File manifestForLink = new File(workDir, "AndroidManifest.xml");
+        copy(L.manifest, manifestForLink);
+        normalizeTargetSdk(manifestForLink, sourceApk, bumpTarget);
 
         // ---- 1+2: aapt2 compile + link ----
         aapt2CompileLink(L, manifestForLink, compiledDir, genDir, baseApk);
@@ -561,40 +571,82 @@ public class ProjectBuilder {
         return def;
     }
 
+    // Минимальный targetSdkVersion, при котором Android НЕ показывает окно
+    // «Это приложение разработано для более старой версии системы…».
+    // (DeprecatedTargetSdkVersionDialog триггерится при target < 23.)
+    private static final int MIN_TARGET_NO_WARNING = 23;
+
     /**
-     * Поднимает targetSdkVersion до 33, чтобы система не показывала окно
-     * «Это приложение разработано для более старой версии системы…».
+     * Выставляет в манифесте КОРРЕКТНЫЙ targetSdkVersion, чтобы:
+     *   • приложение вело себя КАК ОРИГИНАЛ (тот же target, что был в APK), и
+     *   • на новых Android не появлялось окно «для старой версии».
      *
-     * ВАЖНО: apktool при декомпиляции часто НЕ выписывает targetSdkVersion в
-     * текстовый AndroidManifest.xml (оставляет только minSdkVersion). Если
-     * targetSdkVersion не задан, Android считает его равным minSdkVersion — а он
-     * здесь низкий (напр. 9) → появляется предупреждающее окно и приложение
-     * может вести себя некорректно. Поэтому недостаточно ЗАМЕНИТЬ существующий
-     * атрибут — если его нет, его нужно ДОБАВИТЬ. Три случая:
-     *   1) targetSdkVersion есть → заменяем на 33;
-     *   2) targetSdkVersion нет, но есть &lt;uses-sdk&gt; → дописываем атрибут;
-     *   3) &lt;uses-sdk&gt; нет вовсе → вставляем весь тег после &lt;manifest&gt;.
-     * (Путь smali→APK через apktool этим не страдает: там target берётся из
-     * бинарного resources.arsc/apktool.yml, поэтому окна не было.)
+     * Почему это тонко: apktool путь (smali→APK) сохраняет ОРИГИНАЛЬНЫЙ target из
+     * бинарного resources.arsc → приложение работает как оригинал. А jadx-вывод
+     * (java-путь) часто теряет targetSdkVersion в текстовом манифесте (остаётся
+     * только minSdkVersion). Тогда Android берёт target = minSdk (напр. 9) →
+     * окно. Прежняя версия жёстко ставила target=33 — это ЛОМАЛО старые
+     * приложения на новых Android: target≥23 включает runtime-permissions,
+     * target≥29 — scoped storage (WRITE_EXTERNAL_STORAGE перестаёт работать
+     * по-старому), из-за чего приложение камеры падало.
+     *
+     * Правильная стратегия — НЕ завышать target, а взять настоящий:
+     *   1) targetSdkVersion уже есть в манифесте проекта → берём его как есть
+     *      (это и есть «как оригинал»); только если он < 23 — поднимаем до 23,
+     *      чтобы убрать окно (минимально возможный шаг, без scoped storage).
+     *   2) target в манифесте нет → читаем его из оригинального APK (aapt dump
+     *      badging) — это ровно то значение, что использует apktool.
+     *   3) ничего не нашли → ставим 23 (минимум без окна, максимум совместимости:
+     *      scoped storage не включается, поведение близко к legacy).
+     *
+     * @param sourceApk оригинальный APK или null.
+     * @param bumpTarget пользовательская галка «поднять target» — если true и мы
+     *        не нашли оригинал, разрешаем поднять до 23 (иначе оставляем минимум,
+     *        которого достаточно, чтобы не было окна). На деле 23 берётся всегда.
      */
-    private void bumpManifest(File manifest) {
+    private void normalizeTargetSdk(File manifest, File sourceApk, boolean bumpTarget) {
         try {
             String txt = new String(readAll(manifest), "UTF-8");
             String o = txt;
-            // minSdk из манифеста (target не должен быть ниже min).
             int min = readMinSdk(manifest, 1);
-            int target = Math.max(33, min);
+
+            // 1) target уже в манифесте?
+            int existing = readTargetSdk(txt);
+            int target;
+            if (existing > 0) {
+                // Сохраняем оригинальный target; поднимаем ТОЛЬКО если он ниже
+                // порога окна (23). Так поведение остаётся как у оригинала.
+                target = Math.max(existing, MIN_TARGET_NO_WARNING);
+                if (target != existing)
+                    log.line("Манифест: targetSdkVersion " + existing + " → " + target
+                            + " (минимально, чтобы убрать окно «для старой версии»).");
+                else
+                    log.line("Манифест: targetSdkVersion=" + existing + " сохранён (как оригинал).");
+            } else {
+                // 2) из оригинального APK
+                int fromApk = (sourceApk != null) ? readTargetSdkFromApk(sourceApk) : -1;
+                if (fromApk > 0) {
+                    target = Math.max(fromApk, MIN_TARGET_NO_WARNING);
+                    log.line("Манифест: targetSdkVersion взят из оригинала = " + fromApk
+                            + (target != fromApk ? " → поднят до " + target
+                               + " (порог окна)" : " (как оригинал)") + ".");
+                } else {
+                    // 3) fallback
+                    target = MIN_TARGET_NO_WARNING;
+                    log.line("Манифест: targetSdkVersion не найден (jadx потерял, оригинала нет)"
+                            + " → выставляю " + target + " (минимум без окна, legacy-совместимость).");
+                }
+            }
+            // target не может быть ниже minSdk
+            if (target < min) target = min;
             String targetAttr = "android:targetSdkVersion=\"" + target + "\"";
 
             if (txt.matches("(?s).*android:targetSdkVersion=\"[0-9]+\".*")) {
-                // 1) есть — заменяем
                 txt = txt.replaceAll("android:targetSdkVersion=\"[0-9]+\"", targetAttr);
             } else if (txt.matches("(?s).*<uses-sdk\\b.*")) {
-                // 2) нет target, но есть <uses-sdk …> — дописываем атрибут в тег
                 txt = txt.replaceFirst("(<uses-sdk\\b[^>]*?)(\\s*/?>)",
                         "$1 " + java.util.regex.Matcher.quoteReplacement(targetAttr) + "$2");
             } else {
-                // 3) <uses-sdk> вообще нет — вставляем тег сразу после <manifest …>
                 String usesSdk = "\n    <uses-sdk android:minSdkVersion=\"" + Math.max(min, 1)
                         + "\" " + targetAttr + "/>";
                 txt = txt.replaceFirst("(<manifest\\b[^>]*>)",
@@ -604,12 +656,46 @@ public class ProjectBuilder {
             if (!txt.equals(o)) {
                 FileOutputStream fo = new FileOutputStream(manifest);
                 fo.write(txt.getBytes("UTF-8")); fo.close();
-                log.line("Манифест: targetSdkVersion → " + target
-                        + " (убирает окно «для старой версии»)");
-            } else {
-                log.warn("Манифест: не удалось выставить targetSdkVersion (нет <manifest>?).");
             }
-        } catch (Exception e) { log.warn("bumpManifest: " + e.getMessage()); }
+        } catch (Exception e) { log.warn("normalizeTargetSdk: " + e.getMessage()); }
+    }
+
+    /** targetSdkVersion из текста манифеста (-1, если нет). */
+    private int readTargetSdk(String manifestText) {
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("targetSdkVersion=\"(\\d+)\"").matcher(manifestText);
+            if (m.find()) return Integer.parseInt(m.group(1));
+        } catch (Exception ignore) {}
+        return -1;
+    }
+
+    /**
+     * Читает targetSdkVersion из бинарного манифеста ОРИГИНАЛЬНОГО APK через
+     * `aapt dump badging`. Возвращает -1, если не удалось (нет aapt/APK/значения).
+     * Именно так apktool узнаёт оригинальный target — поэтому smali-путь работает
+     * «как оригинал».
+     */
+    private int readTargetSdkFromApk(File apk) {
+        if (apk == null || !apk.exists()) return -1;
+        // aapt2 dump badging печатает "targetSdkVersion:'NN'" (в отличие от aapt v1).
+        // Пробуем aapt2, затем aapt как запасной вариант.
+        java.util.regex.Pattern p = java.util.regex.Pattern
+                .compile("targetSdkVersion:'(\\d+)'");
+        File[] tools = new File[] { tc.aapt2, tc.aapt };
+        for (File tool : tools) {
+            try {
+                if (tool == null || !tool.exists()) continue;
+                StringBuilder out = new StringBuilder();
+                tc.runNative(tool, new String[] { "dump", "badging", apk.getAbsolutePath() }, out);
+                java.util.regex.Matcher m = p.matcher(out.toString());
+                if (m.find()) return Integer.parseInt(m.group(1));
+            } catch (Throwable t) {
+                log.warn("Не удалось прочитать targetSdk (" + (tool != null ? tool.getName() : "null")
+                        + ") из оригинала: " + t);
+            }
+        }
+        return -1;
     }
 
     private String rel(File base, File f) {

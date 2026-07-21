@@ -204,7 +204,7 @@ public class Operations {
         if (L.isValid()) {
             try {
                 log.ok("Найдены AndroidManifest.xml + исходники .java → прямая сборка (как в AIDE).");
-                return directBuild(pb, projectDir, bumpTarget);
+                return directBuild(pb, projectDir, bumpTarget, sourceApk);
             } catch (Throwable e) {
                 // Прямая сборка не удалась (например, jadx-Java с
                 // // decompilation error, или несовместимые ресурсы). Пытаемся
@@ -237,15 +237,21 @@ public class Operations {
     }
 
     /** Прямая сборка из папки исходников (ecj → d8 → aapt2 → package → sign). */
-    private File directBuild(ProjectBuilder pb, File projectDir, boolean bumpTarget) throws Exception {
+    private File directBuild(ProjectBuilder pb, File projectDir, boolean bumpTarget, File sourceApk) throws Exception {
         ensure(new File(OUT_DIR));
         File unsigned = new File(OUT_DIR, projectDir.getName() + "_unsigned.apk");
         File aligned  = new File(OUT_DIR, projectDir.getName() + "_aligned.apk");
         File signed   = new File(OUT_DIR, cleanName(projectDir.getName()) + ".apk");
         unsigned.delete(); aligned.delete(); signed.delete();
 
+        // Оригинальный APK (если есть) — источник настоящего targetSdkVersion,
+        // когда jadx его потерял в текстовом манифесте. Приоритет: сохранённый
+        // в проекте original.apk → выбранный сверху sourceApk.
+        File origApk = new File(projectDir, "original.apk");
+        if (!(origApk.exists() && origApk.length() > 0)) origApk = sourceApk;
+
         File work = new File(tc.frameworkDir.getParentFile(), "build_" + projectDir.getName());
-        pb.buildUnsigned(projectDir, work, unsigned, bumpTarget);
+        pb.buildUnsigned(projectDir, work, unsigned, bumpTarget, origApk);
         if (!unsigned.exists()) throw new Exception("Сборка не создала APK");
 
         alignAndSign(unsigned, aligned, signed);
@@ -315,41 +321,75 @@ public class Operations {
         log.ok("ГОТОВО: " + signed.getAbsolutePath() + "  (" + signed.length() + " байт)");
     }
 
-    // Поднять minSdk/targetSdk чтобы не было окна «для старой версии»
+    // Минимальный targetSdk, при котором нет окна «для старой версии» (порог 23).
+    private static final int MIN_TARGET_NO_WARNING = 23;
+
+    /**
+     * Нормализует targetSdk в apktool-манифесте: СОХРАНЯЕТ оригинальное значение
+     * (чтобы приложение вело себя как оригинал), а поднимает ТОЛЬКО если оно ниже
+     * порога окна 23. Раньше жёстко ставили 33 — это ломало старые приложения на
+     * новых Android (runtime-permissions ≥23, scoped storage ≥29). Теперь smali-
+     * путь остаётся «как оригинал», а окно исчезает.
+     */
     private void bumpManifest(File manifest) {
         try {
             if (!manifest.exists()) return;
             String txt = readAll(manifest);
             String orig = txt;
-            // ВАЖНО: apktool часто НЕ пишет targetSdkVersion в текстовый манифест.
-            // Тогда Android считает target = minSdk (низкий) → окно «для старой
-            // версии». Поэтому если атрибута нет — ДОБАВЛЯЕМ его, а не только
-            // заменяем существующий. (см. аналог в ProjectBuilder.bumpManifest.)
-            if (txt.matches("(?s).*android:targetSdkVersion=\"[0-9]+\".*")) {
-                txt = txt.replaceAll("android:targetSdkVersion=\"[0-9]+\"",
-                        "android:targetSdkVersion=\"33\"");
-            } else if (txt.matches("(?s).*<uses-sdk\\b.*")) {
-                txt = txt.replaceFirst("(<uses-sdk\\b[^>]*?)(\\s*/?>)",
-                        "$1 android:targetSdkVersion=\"33\"$2");
-            } else if (txt.matches("(?s).*<manifest\\b[^>]*>.*")) {
-                txt = txt.replaceFirst("(<manifest\\b[^>]*>)",
-                        "$1\n    <uses-sdk android:minSdkVersion=\"1\" android:targetSdkVersion=\"33\"/>");
-            }
-            if (!txt.equals(orig)) {
-                writeAll(manifest, txt);
-                log.line("Манифест: targetSdkVersion → 33 (убирает окно «для старой версии»)");
+
+            // Существующий target: сохраняем, поднимаем лишь до 23, если ниже.
+            int existing = -1;
+            java.util.regex.Matcher tm = java.util.regex.Pattern
+                    .compile("targetSdkVersion=\"(\\d+)\"").matcher(txt);
+            if (tm.find()) existing = Integer.parseInt(tm.group(1));
+            int min = 1;
+            java.util.regex.Matcher mm = java.util.regex.Pattern
+                    .compile("minSdkVersion=\"(\\d+)\"").matcher(txt);
+            if (mm.find()) min = Integer.parseInt(mm.group(1));
+
+            int target;
+            if (existing > 0) target = Math.max(existing, MIN_TARGET_NO_WARNING);
+            else               target = MIN_TARGET_NO_WARNING;
+            if (target < min) target = min;
+            String ta = "android:targetSdkVersion=\"" + target + "\"";
+
+            if (existing == target && existing > 0) {
+                log.line("Манифест: targetSdkVersion=" + existing + " сохранён (как оригинал).");
             } else {
-                log.line("Манифест: targetSdkVersion не изменён (нет <manifest>? возможно в apktool.yml).");
+                if (txt.matches("(?s).*android:targetSdkVersion=\"[0-9]+\".*")) {
+                    txt = txt.replaceAll("android:targetSdkVersion=\"[0-9]+\"", ta);
+                } else if (txt.matches("(?s).*<uses-sdk\\b.*")) {
+                    txt = txt.replaceFirst("(<uses-sdk\\b[^>]*?)(\\s*/?>)", "$1 " + ta + "$2");
+                } else if (txt.matches("(?s).*<manifest\\b[^>]*>.*")) {
+                    txt = txt.replaceFirst("(<manifest\\b[^>]*>)",
+                            "$1\n    <uses-sdk android:minSdkVersion=\"" + Math.max(min, 1) + "\" " + ta + "/>");
+                }
+                if (!txt.equals(orig)) {
+                    writeAll(manifest, txt);
+                    log.line("Манифест: targetSdkVersion → " + target
+                            + " (минимально, чтобы убрать окно «для старой версии»).");
+                }
             }
-            // apktool.yml targetSdkVersion
+
+            // apktool.yml targetSdkVersion — тоже НЕ ниже порога окна, но не
+            // завышаем сверх оригинала.
             File yml = new File(manifest.getParentFile(), "apktool.yml");
             if (yml.exists()) {
                 String y = readAll(yml);
-                y = y.replaceAll("targetSdkVersion:\\s*'?[0-9]+'?", "targetSdkVersion: '33'");
-                writeAll(yml, y);
+                java.util.regex.Matcher ym = java.util.regex.Pattern
+                        .compile("targetSdkVersion:\\s*'?(\\d+)'?").matcher(y);
+                if (ym.find()) {
+                    int yt = Integer.parseInt(ym.group(1));
+                    int nt = Math.max(yt, MIN_TARGET_NO_WARNING);
+                    if (nt != yt) {
+                        y = y.replaceAll("targetSdkVersion:\\s*'?[0-9]+'?",
+                                "targetSdkVersion: '" + nt + "'");
+                        writeAll(yml, y);
+                    }
+                }
             }
         } catch (Exception e) {
-            log.warn("Не удалось поднять targetSdk: " + e.getMessage());
+            log.warn("Не удалось нормализовать targetSdk: " + e.getMessage());
         }
     }
 
