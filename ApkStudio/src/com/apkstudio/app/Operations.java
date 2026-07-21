@@ -321,14 +321,25 @@ public class Operations {
             if (!manifest.exists()) return;
             String txt = readAll(manifest);
             String orig = txt;
-            txt = txt.replaceAll("android:targetSdkVersion=\"[0-9]+\"",
-                    "android:targetSdkVersion=\"33\"");
-            // если minSdk слишком низкий для Android 8+, оставляем как есть (совместимость вниз ок)
+            // ВАЖНО: apktool часто НЕ пишет targetSdkVersion в текстовый манифест.
+            // Тогда Android считает target = minSdk (низкий) → окно «для старой
+            // версии». Поэтому если атрибута нет — ДОБАВЛЯЕМ его, а не только
+            // заменяем существующий. (см. аналог в ProjectBuilder.bumpManifest.)
+            if (txt.matches("(?s).*android:targetSdkVersion=\"[0-9]+\".*")) {
+                txt = txt.replaceAll("android:targetSdkVersion=\"[0-9]+\"",
+                        "android:targetSdkVersion=\"33\"");
+            } else if (txt.matches("(?s).*<uses-sdk\\b.*")) {
+                txt = txt.replaceFirst("(<uses-sdk\\b[^>]*?)(\\s*/?>)",
+                        "$1 android:targetSdkVersion=\"33\"$2");
+            } else if (txt.matches("(?s).*<manifest\\b[^>]*>.*")) {
+                txt = txt.replaceFirst("(<manifest\\b[^>]*>)",
+                        "$1\n    <uses-sdk android:minSdkVersion=\"1\" android:targetSdkVersion=\"33\"/>");
+            }
             if (!txt.equals(orig)) {
                 writeAll(manifest, txt);
                 log.line("Манифест: targetSdkVersion → 33 (убирает окно «для старой версии»)");
             } else {
-                log.line("Манифест: targetSdkVersion не найден в тексте (возможно в apktool.yml).");
+                log.line("Манифест: targetSdkVersion не изменён (нет <manifest>? возможно в apktool.yml).");
             }
             // apktool.yml targetSdkVersion
             File yml = new File(manifest.getParentFile(), "apktool.yml");

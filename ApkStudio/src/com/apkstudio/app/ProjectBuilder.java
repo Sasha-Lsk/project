@@ -561,16 +561,53 @@ public class ProjectBuilder {
         return def;
     }
 
+    /**
+     * Поднимает targetSdkVersion до 33, чтобы система не показывала окно
+     * «Это приложение разработано для более старой версии системы…».
+     *
+     * ВАЖНО: apktool при декомпиляции часто НЕ выписывает targetSdkVersion в
+     * текстовый AndroidManifest.xml (оставляет только minSdkVersion). Если
+     * targetSdkVersion не задан, Android считает его равным minSdkVersion — а он
+     * здесь низкий (напр. 9) → появляется предупреждающее окно и приложение
+     * может вести себя некорректно. Поэтому недостаточно ЗАМЕНИТЬ существующий
+     * атрибут — если его нет, его нужно ДОБАВИТЬ. Три случая:
+     *   1) targetSdkVersion есть → заменяем на 33;
+     *   2) targetSdkVersion нет, но есть &lt;uses-sdk&gt; → дописываем атрибут;
+     *   3) &lt;uses-sdk&gt; нет вовсе → вставляем весь тег после &lt;manifest&gt;.
+     * (Путь smali→APK через apktool этим не страдает: там target берётся из
+     * бинарного resources.arsc/apktool.yml, поэтому окна не было.)
+     */
     private void bumpManifest(File manifest) {
         try {
             String txt = new String(readAll(manifest), "UTF-8");
             String o = txt;
-            txt = txt.replaceAll("android:targetSdkVersion=\"[0-9]+\"",
-                    "android:targetSdkVersion=\"33\"");
+            // minSdk из манифеста (target не должен быть ниже min).
+            int min = readMinSdk(manifest, 1);
+            int target = Math.max(33, min);
+            String targetAttr = "android:targetSdkVersion=\"" + target + "\"";
+
+            if (txt.matches("(?s).*android:targetSdkVersion=\"[0-9]+\".*")) {
+                // 1) есть — заменяем
+                txt = txt.replaceAll("android:targetSdkVersion=\"[0-9]+\"", targetAttr);
+            } else if (txt.matches("(?s).*<uses-sdk\\b.*")) {
+                // 2) нет target, но есть <uses-sdk …> — дописываем атрибут в тег
+                txt = txt.replaceFirst("(<uses-sdk\\b[^>]*?)(\\s*/?>)",
+                        "$1 " + java.util.regex.Matcher.quoteReplacement(targetAttr) + "$2");
+            } else {
+                // 3) <uses-sdk> вообще нет — вставляем тег сразу после <manifest …>
+                String usesSdk = "\n    <uses-sdk android:minSdkVersion=\"" + Math.max(min, 1)
+                        + "\" " + targetAttr + "/>";
+                txt = txt.replaceFirst("(<manifest\\b[^>]*>)",
+                        "$1" + java.util.regex.Matcher.quoteReplacement(usesSdk));
+            }
+
             if (!txt.equals(o)) {
                 FileOutputStream fo = new FileOutputStream(manifest);
                 fo.write(txt.getBytes("UTF-8")); fo.close();
-                log.line("Манифест: targetSdkVersion → 33");
+                log.line("Манифест: targetSdkVersion → " + target
+                        + " (убирает окно «для старой версии»)");
+            } else {
+                log.warn("Манифест: не удалось выставить targetSdkVersion (нет <manifest>?).");
             }
         } catch (Exception e) { log.warn("bumpManifest: " + e.getMessage()); }
     }
