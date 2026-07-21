@@ -332,6 +332,14 @@ public class Apktool {
         } catch (Throwable t) {
             log.warn("res: правка '$'-имён перед сборкой пропущена: " + t);
         }
+        // Страховка: фиктивные <drawable/color>false</> заглушки apktool
+        // (см. DummyResFix) — на случай использования нашего aapt2 напрямую.
+        try {
+            File res = new File(projectDir, "res");
+            if (res.isDirectory()) DummyResFix.fix(res, log);
+        } catch (Throwable t) {
+            log.warn("res: правка заглушек drawable/color перед сборкой пропущена: " + t);
+        }
         // Разовая ПОЧИНКА испорченного public.xml. Прошлые версии ApkStudio при
         // повторной попытке дважды комментировали <public> → в файле остались
         // вложенные "<!-- <!-- … --> -->", из-за которых aapt2 падал с
@@ -1111,9 +1119,29 @@ public class Apktool {
             for (String rel : files) {
                 if (seen.add(rel)) {
                     int done = Math.min(seen.size(), total);
-                    log.progress(stage, done, total, rel);
+                    log.progress(stage, done, total, labelForBuildFile(rel));
                 }
             }
+        }
+
+        /**
+         * Человекочитаемая подпись для файла, участвующего в сборке APK, — чтобы
+         * в логе/окне прогресса было понятно, ЧТО именно обрабатывается/куда
+         * добавляется (запись финального APK: код classes.dex, таблица
+         * resources.arsc, манифест, ресурс, нативная библиотека, ассет).
+         */
+        private String labelForBuildFile(String rel) {
+            if (rel == null) return "";
+            String r = rel;
+            if (r.startsWith("apk/")) r = r.substring(4);   // запись финального APK
+            else return rel;                                // промежуточный build/…, tmp/…, smali/…
+            if (r.equals("resources.arsc")) return "APK ← resources.arsc (таблица ресурсов)";
+            if (r.equals("AndroidManifest.xml")) return "APK ← AndroidManifest.xml (манифест)";
+            if (r.matches("classes\\d*\\.dex")) return "APK ← код " + r;
+            if (r.startsWith("res/")) return "APK ← ресурс " + r;
+            if (r.startsWith("lib/")) return "APK ← нативная lib " + r;
+            if (r.startsWith("assets/")) return "APK ← ассет " + r;
+            return "APK ← " + r;
         }
 
         /** Исходные файлы проекта, которые apktool упаковывает в APK. */

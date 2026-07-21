@@ -186,25 +186,58 @@ public class ProjectBuilder {
 
         List<String> linkInputs = new ArrayList<String>();
 
+        // Санация ресурсов ПЕРЕД aapt2 compile: apktool при декомпиляции пишет
+        // фиктивные <drawable ...>false</drawable> (заглушки для отсутствующих
+        // в APK ресурсов Google Play Services / фреймворка). Собственный aapt
+        // apktool их принимает (поэтому smali→APK через apktool собирается), а
+        // прямой aapt2 compile падает: "error: invalid drawable". Заменяем
+        // такие значения на прозрачный цвет, сохраняя тип/имя/id ресурса.
         if (L.resDir != null && L.resDir.isDirectory()) {
-            // aapt2 compile --dir res -o compiled.zip
+            try { DummyResFix.fix(L.resDir, log); }
+            catch (Throwable t) { log.warn("res: правка заглушек drawable/color пропущена: " + t); }
+        }
+
+        if (L.resDir != null && L.resDir.isDirectory()) {
+            // aapt2 compile -v --dir res -o compiled.zip
+            // Флаг -v заставляет aapt2 печатать по строке на КАЖДЫЙ ресурс
+            // ("<path>: note: compiling <path>"). По этим строкам показываем
+            // ПОФАЙЛОВЫЙ прогресс — какой именно ресурс сейчас идёт в
+            // resources.arsc (ровно как при декомпиляции показывается каждый
+            // распаковываемый файл).
             File compiledZip = new File(compiledDir, "resources.zip");
+            final int resTotal = countTree(L.resDir);
+            final int[] cDone = {0};
+            log.progress("aapt2: компиляция ресурсов → resources.arsc", 0, resTotal, null);
             StringBuilder o = new StringBuilder();
             int c = tc.runNative(tc.aapt2, new String[] {
-                    "compile", "--dir", L.resDir.getAbsolutePath(),
+                    "compile", "-v", "--dir", L.resDir.getAbsolutePath(),
                     "-o", compiledZip.getAbsolutePath()
-            }, o);
+            }, o, new Toolchain.LineCB() {
+                public void onLine(String line) {
+                    String name = extractAaptFile(line);
+                    if (name != null) {
+                        cDone[0]++;
+                        log.progress("aapt2: компиляция ресурсов → resources.arsc",
+                                cDone[0], resTotal, name);
+                    }
+                }
+            });
             if (c != 0 || !compiledZip.exists())
                 throw new Exception("aapt2 compile завершился с кодом " + c + ":\n" + o);
-            log.ok("aapt2 compile: OK");
+            log.progress("aapt2: компиляция ресурсов → resources.arsc", resTotal, resTotal, null);
+            log.ok("aapt2 compile: OK — " + cDone[0] + " ресурсов → resources.arsc");
             linkInputs.add(compiledZip.getAbsolutePath());
         } else {
             log.warn("res/ не найдена — линкую APK без пользовательских ресурсов.");
         }
 
-        // aapt2 link -o base.apk -I android.jar --manifest M --java gen [compiled...]
+        // aapt2 link -v -o base.apk -I android.jar --manifest M --java gen [compiled...]
+        // -v показывает пофайлово, что именно линкуется/пишется в resources.arsc
+        // (таблица ресурсов) — чтобы прогресс отражал «что» добавляется, а не
+        // «застревал» на одном месте.
         List<String> args = new ArrayList<String>();
         args.add("link");
+        args.add("-v");
         args.add("-o"); args.add(baseApk.getAbsolutePath());
         args.add("-I"); args.add(tc.androidJar.getAbsolutePath());
         args.add("--manifest"); args.add(manifest.getAbsolutePath());
@@ -213,11 +246,21 @@ public class ProjectBuilder {
         // разрешаем без версии/имени — берём из манифеста
         for (String in : linkInputs) args.add(in);
 
+        final int[] lDone = {0};
+        log.progress("aapt2: линковка → resources.arsc", 0, 0, null);
         StringBuilder lo = new StringBuilder();
-        int lc = tc.runNative(tc.aapt2, args.toArray(new String[0]), lo);
+        int lc = tc.runNative(tc.aapt2, args.toArray(new String[0]), lo, new Toolchain.LineCB() {
+            public void onLine(String line) {
+                String name = extractAaptFile(line);
+                if (name != null) {
+                    lDone[0]++;
+                    log.progress("aapt2: линковка → resources.arsc", lDone[0], 0, name);
+                }
+            }
+        });
         if (lc != 0 || !baseApk.exists())
             throw new Exception("aapt2 link завершился с кодом " + lc + ":\n" + lo);
-        log.ok("aapt2 link: OK — base.apk + R.java созданы");
+        log.ok("aapt2 link: OK — resources.arsc + base.apk + R.java созданы");
     }
 
     // =========================================================
@@ -243,7 +286,10 @@ public class ProjectBuilder {
             ByteArrayOutputStream bo = new ByteArrayOutputStream();
             int n; while ((n = zis.read(buf)) > 0) bo.write(buf, 0, n);
             writeEntry(zos, e.getName(), bo.toByteArray(), added);
-            pkgProgress(e.getName());
+            // Явно показываем, ЧТО именно кладём в APK: таблицу ресурсов,
+            // манифест, ресурс — чтобы в логе/окне прогресса было видно каждое
+            // добавление (как просит пользователь), а не просто «файл».
+            pkgProgress(labelForApkEntry(e.getName()));
             zis.closeEntry();
         }
         zis.close();
@@ -255,7 +301,7 @@ public class ProjectBuilder {
             for (File d : dexes) {
                 if (d.getName().endsWith(".dex")) {
                     writeEntry(zos, d.getName(), readAll(d), added);
-                    pkgProgress(d.getName());
+                    pkgProgress("код → " + d.getName());
                 }
             }
         }
@@ -413,8 +459,47 @@ public class ProjectBuilder {
         for (File f : ch) {
             String entry = prefix + f.getName();
             if (f.isDirectory()) addTree(zos, f, entry + "/", added);
-            else { writeEntry(zos, entry, readAll(f), added); pkgProgress(entry); }
+            else { writeEntry(zos, entry, readAll(f), added); pkgProgress(labelForApkEntry(entry)); }
         }
+    }
+
+    /**
+     * Из строки вывода aapt2 (-v) достаёт короткое имя обрабатываемого файла.
+     * aapt2 печатает, напр.:
+     *   /.../res/drawable/ic.png: note: compiling PNG file /.../ic.png
+     *   /.../res/values/strings.xml: note: compiling ...
+     * Берём путь ДО первого ": " и возвращаем его последний сегмент
+     * (папка/имя, напр. "drawable/ic.png"). Если строка не про файл — null.
+     */
+    private String extractAaptFile(String line) {
+        if (line == null) return null;
+        int idx = line.indexOf(": note: compiling");
+        if (idx < 0) idx = line.indexOf(": error");
+        if (idx <= 0) return null;
+        String path = line.substring(0, idx).trim();
+        if (path.length() == 0) return null;
+        // Короткое имя: последняя папка + имя файла (как в декомпиляции).
+        String norm = path.replace('\\', '/');
+        int slash = norm.lastIndexOf('/');
+        if (slash < 0) return norm;
+        int prev = norm.lastIndexOf('/', slash - 1);
+        return (prev >= 0) ? norm.substring(prev + 1) : norm.substring(slash + 1);
+    }
+
+    /**
+     * Человекочитаемая подпись для записи, добавляемой в APK, — чтобы в
+     * логе/окне прогресса было понятно, ЧТО именно добавляется (таблица
+     * ресурсов, манифест, ресурс, нативная библиотека, ассет).
+     */
+    private String labelForApkEntry(String name) {
+        if (name == null) return "";
+        if (name.equals("resources.arsc")) return "resources.arsc (таблица ресурсов)";
+        if (name.equals("AndroidManifest.xml")) return "AndroidManifest.xml (манифест)";
+        if (name.matches("classes\\d*\\.dex")) return "код → " + name;
+        if (name.startsWith("res/")) return "ресурс → " + name;
+        if (name.startsWith("lib/")) return "нативная lib → " + name;
+        if (name.startsWith("assets/")) return "ассет → " + name;
+        return name;
     }
 
     // ---- прогресс упаковки ----

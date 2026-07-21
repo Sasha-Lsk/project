@@ -199,7 +199,23 @@ public class Toolchain {
 
     // ---------- Запуск нативных бинарников (aapt2/zipalign) ----------
 
+    /**
+     * Колбэк на каждую строку живого вывода нативного бинарника (aapt2 -v и т.п.).
+     * Позволяет вызывающей стороне показывать ПОФАЙЛОВЫЙ прогресс в реальном
+     * времени (какой ресурс сейчас компилируется/линкуется в resources.arsc).
+     */
+    public interface LineCB { void onLine(String line); }
+
     public int runNative(File tool, String[] args, StringBuilder outCollector) throws Exception {
+        return runNative(tool, args, outCollector, null);
+    }
+
+    /**
+     * То же, что runNative(tool,args,out), но с колбэком на КАЖДУЮ строку вывода.
+     * Строки по-прежнему пишутся в журнал; колбэк вызывается дополнительно (может
+     * быть null). Ошибка внутри колбэка не прерывает чтение вывода процесса.
+     */
+    public int runNative(File tool, String[] args, StringBuilder outCollector, LineCB cb) throws Exception {
         java.util.List<String> cmd = new java.util.ArrayList<String>();
         cmd.add(tool.getAbsolutePath());
         for (String a : args) cmd.add(a);
@@ -224,11 +240,16 @@ public class Toolchain {
                 if (ch == '\n') {
                     String s = lineBuf.toString(); lineBuf.setLength(0);
                     if (outCollector != null) outCollector.append(s).append('\n');
+                    if (cb != null) { try { cb.onLine(s); } catch (Throwable ignore) {} }
                     if (s.toLowerCase().contains("error")) log.err(s); else log.line(s);
                 } else if (ch != '\r') lineBuf.append(ch);
             }
         }
-        if (lineBuf.length() > 0) log.line(lineBuf.toString());
+        if (lineBuf.length() > 0) {
+            String s = lineBuf.toString();
+            if (cb != null) { try { cb.onLine(s); } catch (Throwable ignore) {} }
+            log.line(s);
+        }
         int code = p.waitFor();
         return code;
     }
