@@ -84,18 +84,36 @@ public class Engine {
         log.progress(10);
         out.mkdirs();
         runJadxApi(apk, out);
-        log.progress(85);
+        log.progress(75);
 
         // В проекте AIDE НЕ должно быть скомпилированного кода: убираем любые
         // classes*.dex, которые jadx мог скопировать в вывод. Исходник кода —
         // это .java в sources/, он и компилируется при сборке.
         removeDexFiles(out);
 
-        log.log("Готово. Проект в формате AIDE:");
-        log.log("  sources/   — исходный код .java (правьте здесь).");
-        log.log("  resources/ — AndroidManifest.xml, res/, assets/, lib/.");
-        log.log("При сборке java->apk код компилируется заново (aapt2 + ecj + d8),");
-        log.log("готовый dex/apk в проект НЕ кладутся — всё как в AIDE.");
+        // НАДЁЖНАЯ ПЕРЕСБОРКА (как smali->apk). Дополнительно раскладываем в тот
+        // же проект ПОЛНЫЙ apktool-проект (smali/ + apktool.yml + res/ +
+        // AndroidManifest.xml + lib/ + assets/) — прямо в КОРЕНЬ проекта. Тогда
+        // при сборке java->apk движок видит apktool.yml/smali и собирает через
+        // apktool b (переассемблируя ОРИГИНАЛЬНЫЙ байткод 1:1) — тот же путь,
+        // что и smali->apk. Это устраняет причину «пересобранное не запускается»:
+        // рефлексия (InvokeHelper), native-методы, точные сигнатуры и внешние
+        // классы сохраняются как в оригинале, а не пересобираются из lossy-jadx.
+        // Каталог sources/ (java от jadx) остаётся для чтения/правки кода.
+        try {
+            embedApktoolProject(apk, out);
+        } catch (Throwable t) {
+            log.err("Не удалось разложить apktool-проект (smali) в вывод: " + t
+                    + ". Сборка java->apk будет через ecj (менее надёжно).");
+        }
+
+        log.log("Готово. Проект:");
+        log.log("  sources/   — исходный код .java (jadx) — для чтения/правок.");
+        log.log("  smali/, apktool.yml, res/, AndroidManifest.xml, lib/, assets/");
+        log.log("             — apktool-проект (оригинальный байткод).");
+        log.log("При сборке java->apk используется НАДЁЖНЫЙ путь apktool b (как");
+        log.log("smali->apk): байткод переассемблируется 1:1 — приложение");
+        log.log("запускается стабильно (рефлексия/native/внешние классы целы).");
 
         log.progress(90);
         listTree(out);
@@ -123,6 +141,69 @@ public class Engine {
             if (removed > 0) log.log("Убрано dex из вывода jadx: " + removed);
         } catch (Throwable t) {
             log.err("removeDexFiles: " + t);
+        }
+    }
+
+    /**
+     * Разложить в каталог проекта out полноценный apktool-проект (декодировав apk
+     * через apktool d): каталоги smali, apktool.yml, AndroidManifest.xml, res,
+     * lib, assets, original, unknown. Кладём прямо в КОРЕНЬ проекта, НЕ затирая
+     * уже созданные jadx-каталоги sources и resources.
+     *
+     * Смысл: после этого javaToApk видит apktool.yml/smali в корне и собирает
+     * проект НАДЁЖНЫМ путём smaliToApk (apktool b), переассемблируя ОРИГИНАЛЬНЫЙ
+     * байткод один-в-один — как smali->apk. Именно это и просили: java->apk по
+     * надёжности = smali->apk. jadx-код в sources остаётся для чтения/правок.
+     */
+    private void embedApktoolProject(File apk, File out) throws Exception {
+        log.log("apktool d (для надёжной пересборки apktool b, как smali->apk)...");
+        log.progress(82);
+        File tmp = new File(ctx.getCacheDir(), "apk_d_" + System.currentTimeMillis());
+        rmdir(tmp);
+        String[] args = {
+                "d", "-f",
+                "--frame-path", new File(dirEngine, "framework").getAbsolutePath(),
+                "-o", tmp.getAbsolutePath(),
+                apk.getAbsolutePath()
+        };
+        runApktool(args);
+        if (!new File(tmp, "apktool.yml").exists()) {
+            rmdir(tmp);
+            throw new Exception("apktool d не создал apktool.yml");
+        }
+        // Переносим содержимое apktool-проекта в корень out, не трогая
+        // sources/ и resources/ (это вывод jadx для чтения кода).
+        File[] items = tmp.listFiles();
+        int moved = 0;
+        if (items != null) for (File it : items) {
+            String nm = it.getName();
+            if (nm.equals("sources") || nm.equals("resources")) continue;
+            File dst = new File(out, nm);
+            rmdir(dst);
+            if (dst.exists()) dst.delete();
+            if (!it.renameTo(dst)) { copyAny(it, dst); }
+            moved++;
+        }
+        rmdir(tmp);
+        log.log("apktool-проект разложен в корень (" + moved + " элементов): "
+                + "smali/apktool.yml/res/AndroidManifest.xml/lib/assets. "
+                + "Сборка java->apk пойдёт через apktool b (оригинальный байткод).");
+    }
+
+    /** Рекурсивно скопировать файл/каталог (fallback, если renameTo не сработал). */
+    private void copyAny(File src, File dst) throws Exception {
+        if (src.isDirectory()) {
+            dst.mkdirs();
+            File[] kids = src.listFiles();
+            if (kids != null) for (File k : kids) copyAny(k, new File(dst, k.getName()));
+        } else {
+            File p = dst.getParentFile();
+            if (p != null) p.mkdirs();
+            java.io.FileInputStream in = new java.io.FileInputStream(src);
+            java.io.FileOutputStream ou = new java.io.FileOutputStream(dst);
+            byte[] b = new byte[65536]; int n;
+            try { while ((n = in.read(b)) > 0) ou.write(b, 0, n); }
+            finally { in.close(); ou.close(); }
         }
     }
 
@@ -187,9 +268,16 @@ public class Engine {
         prepare();
         log.log("Сборка java-проекта -> APK: " + projectDir.getName());
 
-        if (new File(projectDir, "apktool.yml").exists()
-                || new File(projectDir, "smali").isDirectory()) {
-            return smaliToApk(projectDir, outRoot, androidVer);
+        // НАДЁЖНЫЙ ПУТЬ (как smali->apk): если в проекте есть apktool-проект со
+        // smali (оригинальный байткод), собираем через apktool b — байткод
+        // переассемблируется 1:1, приложение запускается стабильно. Это то, что
+        // теперь кладёт apk->java рядом с sources/. Ищем apktool-корень в самом
+        // projectDir и, для совместимости, вложенным (например под resources/).
+        File apktoolRoot = findApktoolRoot(projectDir);
+        if (apktoolRoot != null) {
+            log.log("Найден apktool-проект со smali (" + apktoolRoot.getName()
+                    + ") -> сборка apktool b (надёжный путь, как smali->apk).");
+            return smaliToApk(apktoolRoot, outRoot, androidVer);
         }
 
         File resRoot = locateResRoot(projectDir);
@@ -210,6 +298,34 @@ public class Engine {
         buildLikeAide(projectDir, srcRoot, resRoot, finalApk, androidVer);
         log.progress(100);
         return finalApk;
+    }
+
+    /**
+     * Найти корень apktool-проекта, пригодного для НАДЁЖНОЙ сборки apktool b.
+     * Требуется apktool.yml И каталог smali* (оригинальный байткод). Ищем в самом
+     * dir и в типичных вложенных местах (resources/). Возвращает каталог или null.
+     */
+    private File findApktoolRoot(File dir) {
+        if (dir == null) return null;
+        java.util.List<File> cand = new java.util.ArrayList<File>();
+        cand.add(dir);
+        cand.add(new File(dir, "resources"));
+        for (File c : cand) {
+            if (c == null || !c.isDirectory()) continue;
+            if (!new File(c, "apktool.yml").exists()) continue;
+            if (hasSmaliDir(c)) return c;
+        }
+        return null;
+    }
+
+    /** Есть ли в каталоге хотя бы одна папка smali / smali_classesN. */
+    private static boolean hasSmaliDir(File dir) {
+        File[] kids = dir.listFiles();
+        if (kids == null) return false;
+        for (File k : kids) {
+            if (k.isDirectory() && k.getName().matches("smali(_classes\\d+)?")) return true;
+        }
+        return false;
     }
 
     /** Найти каталог, содержащий AndroidManifest.xml. */
