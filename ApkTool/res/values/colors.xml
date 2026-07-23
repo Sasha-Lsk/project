@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0E1116</color>
+    <color name="bg_card">#171C24</color>
+    <color name="accent">#2FD37A</color>
+    <color name="accent_dk">#1E8F52</color>
+    <color name="blue">#3B82F6</color>
+    <color name="blue_dk">#2563EB</color>
+    <color name="text">#E6EAF0</color>
+    <color name="text_dim">#8A94A6</color>
+    <color name="log_bg">#0A0D12</color>
+    <color name="log_text">#B7F5C8</color>
+    <color name="err">#FF5A5A</color>
+    <color name="stroke">#2A313C</color>
+</resources>
