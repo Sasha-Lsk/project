@@ -1,2 +1,0 @@
-Fixed: Code completion
-Improved: Updated PhoneGap app template
