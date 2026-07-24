@@ -1961,8 +1961,8 @@ public class Engine {
      * попадает в область видимости блока и покрывает все обращения к ident внутри
      * него. Это точный, пометодный фикс (без ложных срабатываний по всему файлу).
      */
-    private void autoFixJadxDefects(java.util.List<File> javaFiles) {
-        int fixedFiles = 0, fixedVars = 0, fixedInt = 0;
+     private void autoFixJadxDefects(java.util.List<File> javaFiles) {
+        int fixedFiles = 0, fixedVars = 0, fixedInt = 0, fixedRead = 0, fixedLoop = 0;
         for (File f : javaFiles) {
             try {
                 String c = readFile(f);
@@ -1970,16 +1970,299 @@ public class Engine {
                 String nc = fixUndeclaredCatchVar(c, cv);
                 int[] ci = new int[1];
                 nc = fixCheckedInterrupted(nc, ci);
+                // КРИТИЧНО для рантайма: восстанавливаем потерянное jadx чтение
+                // потока в условии цикла — иначе цикл становится «мёртвым», и
+                // код компилируется, но НЕ РАБОТАЕТ (напр. не читается скрипт
+                // настройки камеры -> чёрный экран). Делать ДО declareMissingVariable.
+                int[] cr = new int[1];
+                nc = fixLostStreamReadLoop(nc, cr);
+                // КРИТИЧНО для рантайма: чиним ГАРАНТИРОВАННО-БЕСКОНЕЧНЫЙ цикл
+                // `while (true) { ... if (cond) { } ... i++; }` (jadx потерял
+                // break в теле if цикла-поиска). Такой цикл компилируется, но
+                // НАМЕРТВО вешает поток. Если это UI-поток инициализации камеры,
+                // превью никогда не стартует -> бесконечный чёрный экран.
+                int[] cl = new int[1];
+                nc = fixDeadSearchLoop(nc, cl);
                 if (!nc.equals(c)) {
                     write(f, nc); fixedFiles++;
-                    fixedVars += cv[0]; fixedInt += ci[0];
+                    fixedVars += cv[0]; fixedInt += ci[0]; fixedRead += cr[0];
+                    fixedLoop += cl[0];
                 }
             } catch (Throwable t) {
                 log.err("autoFixJadxDefects(" + f.getName() + "): " + t);
             }
         }
         if (fixedFiles > 0) log.log("Автопочинка jadx: catch-переменных " + fixedVars
-                + ", обёрнуто wait/sleep/join " + fixedInt + " (файлов: " + fixedFiles + ").");
+                + ", обёрнуто wait/sleep/join " + fixedInt
+                + ", восстановлено чтений потока в цикле " + fixedRead
+                + ", разомкнуто бесконечных циклов " + fixedLoop
+                + " (файлов: " + fixedFiles + ").");
+    }
+
+    /**
+     * Разомкнуть ГАРАНТИРОВАННО-БЕСКОНЕЧНЫЙ цикл-поиск, потерявший {@code break}.
+     *
+     * <p>Дефект jadx: оригинальный цикл-поиск вида
+     * <pre>for (int i = 0; i &lt; arr.length; i++) { if (match(arr[i])) { ...; break; } }</pre>
+     * декомпилируется в мёртвую бесконечную форму
+     * <pre>i = 0;
+     *while (true) {
+     *    if (i &gt;= arr.length) {   // тело ПУСТОЕ — jadx потерял break
+     *    }
+     *    i++;
+     *}</pre>
+     * Условие выхода {@code i >= len} есть, но {@code break} внутри {@code if}
+     * потерян -> {@code if} с пустым телом ничего не делает -> цикл крутится
+     * вечно. Код компилируется, но НАМЕРТВО вешает поток (в камере — поток
+     * инициализации превью, из-за чего экран остаётся чёрным).
+     *
+     * <p>Чиним точечно и безопасно: находим ровно шаблон
+     * {@code while (true) { <ws> if ( <cond> ) { <только ws> } ... }} где в теле
+     * цикла НЕТ ни одного {@code break}/{@code return}/{@code throw} (то есть
+     * выхода действительно нет), и вставляем {@code break;} в пустое тело
+     * {@code if}. Это восстанавливает выход из цикла по уже присутствующему
+     * условию — то самое, что потерял jadx. Если тело {@code if} не пустое или в
+     * цикле уже есть выход, НИЧЕГО не трогаем (без ложных срабатываний).
+     */
+    private String fixDeadSearchLoop(String code, int[] cnt) {
+        int pos = 0;
+        StringBuilder out = new StringBuilder();
+        while (true) {
+            int w = indexOfWhileTrue(code, pos);
+            if (w < 0) { out.append(code.substring(pos)); break; }
+            int braceOpen = code.indexOf('{', w);
+            if (braceOpen < 0) { out.append(code.substring(pos)); break; }
+            int braceClose = matchBrace(code, braceOpen);
+            if (braceClose < 0) { out.append(code.substring(pos)); break; }
+            String body = code.substring(braceOpen + 1, braceClose);
+            // Есть ли в теле цикла хоть какой-то выход? Тогда цикл не «мёртвый».
+            boolean hasExit = java.util.regex.Pattern.compile(
+                    "\\b(break|return|throw|System\\s*\\.\\s*exit|continue\\s+\\w)")
+                    .matcher(body).find();
+            String newBody = null;
+            if (!hasExit) newBody = insertBreakIntoEmptyIf(body);
+            if (newBody != null) {
+                out.append(code, pos, braceOpen + 1);
+                out.append(newBody);
+                out.append('}');
+                pos = braceClose + 1;
+                cnt[0]++;
+            } else {
+                // не трогаем этот while(true), идём дальше от его начала
+                out.append(code, pos, w + 5);
+                pos = w + 5; // сдвиг за "while"
+            }
+        }
+        return out.toString();
+    }
+
+    /** Индекс начала конструкции {@code while ( true )} начиная с from, или -1. */
+    private int indexOfWhileTrue(String code, int from) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "while\\s*\\(\\s*true\\s*\\)").matcher(code);
+        if (m.find(from)) return m.start();
+        return -1;
+    }
+
+    /**
+     * В теле цикла находит ПЕРВЫЙ {@code if ( cond ) { }} с пустым (только
+     * пробелы) телом и вставляет туда {@code break;}. Возвращает новое тело либо
+     * null, если подходящего пустого if нет.
+     */
+    private String insertBreakIntoEmptyIf(String body) {
+        int i = 0;
+        while (i < body.length()) {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\bif\\s*\\(").matcher(body);
+            if (!m.find(i)) return null;
+            int condOpen = m.end() - 1;            // на '('
+            int condClose = matchParen(body, condOpen);
+            if (condClose < 0) return null;
+            // после условия ждём '{'
+            int j = condClose + 1;
+            while (j < body.length() && Character.isWhitespace(body.charAt(j))) j++;
+            if (j < body.length() && body.charAt(j) == '{') {
+                int ifClose = matchBrace(body, j);
+                if (ifClose < 0) return null;
+                String inner = body.substring(j + 1, ifClose);
+                if (inner.trim().isEmpty()) {
+                    // вставляем break в пустое тело if
+                    String indent = leadingIndent(body, m.start());
+                    return body.substring(0, j + 1)
+                            + "\n" + indent + "    break; /* [ApkTool] восстановлен выход из цикла (дефект jadx) */\n"
+                            + indent + body.substring(ifClose);
+                }
+            }
+            i = m.end();
+        }
+        return null;
+    }
+
+    /** Отступ (пробелы/табы) строки, содержащей позицию at. */
+    private String leadingIndent(String s, int at) {
+        int ls = s.lastIndexOf('\n', at);
+        int p = ls + 1;
+        StringBuilder sb = new StringBuilder();
+        while (p < s.length() && (s.charAt(p) == ' ' || s.charAt(p) == '\t')) { sb.append(s.charAt(p)); p++; }
+        return sb.toString();
+    }
+
+    /**
+     * Восстановить ПОТЕРЯННОЕ jadx присваивание-чтение потока в условии цикла.
+     *
+     * <p>Классический дефект jadx (помечает метод «Code decompiled incorrectly»):
+     * оригинал
+     * <pre>while ((nRead = stream.read(buf)) &gt; 0) { ... }</pre>
+     * декомпилируется в
+     * <pre>while (nRead &gt; 0) { ... }</pre>
+     * — присваивание {@code nRead = stream.read(buf)} внутри условия теряется.
+     * Переменная {@code nRead} нигде не объявлена, поэтому ecj ругается
+     * «nRead cannot be resolved to a variable». Прежняя автопочинка лишь
+     * объявляла {@code int nRead = 0;} — код КОМПИЛИРОВАЛСЯ, но цикл становился
+     * мёртвым (условие всегда ложно), т.е. поток НЕ читался. Приложение
+     * запускалось, но работало неверно (например, у камеры не читался скрипт
+     * настройки под модель устройства -> бесконечный чёрный экран превью).
+     *
+     * <p>Здесь мы восстанавливаем семантику: находим цикл вида
+     * {@code while (VAR OP LIT)} с неизвестной (необъявленной) VAR, OP из
+     * {@code >,>=,!=}, LIT из {@code 0,-1}; в ТОМ ЖЕ методе находим переменную
+     * потока (объявлена типом *InputStream/*Reader или получена из
+     * getAssets().open(...)/openRawResource(...)/new FileInputStream(...)) и
+     * буфер (byte[]/char[]). Заменяем условие на
+     * {@code while ((VAR = stream.read(buf)) OP LIT)} и объявляем {@code int VAR}
+     * перед циклом. Правка применяется ТОЛЬКО когда однозначно найдены и поток, и
+     * буфер, и VAR действительно не объявлена — иначе цикл не трогаем.
+     */
+    private String fixLostStreamReadLoop(String code, int[] cnt) {
+        // Ищем кандидаты: while (VAR OP LIT) где VAR — простой идентификатор.
+        java.util.regex.Pattern loopP = java.util.regex.Pattern.compile(
+                "while\\s*\\(\\s*([A-Za-z_$][\\w$]*)\\s*(>=|>|!=)\\s*(-?\\d+)\\s*\\)");
+        java.util.regex.Matcher m = loopP.matcher(code);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            String var = m.group(1), op = m.group(2), lit = m.group(3);
+            // Условие-«хвост» цикла чтения: (>0)/(>=0)/(!=-1). Иначе не наш случай.
+            boolean readLike = ("0".equals(lit) && (">".equals(op) || ">=".equals(op)))
+                    || ("-1".equals(lit) && "!=".equals(op));
+            if (!readLike) { m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(m.group())); continue; }
+            // Границы метода, содержащего этот while.
+            int pos = m.start();
+            int mStart = methodBodyStart(code, pos);
+            int mEnd = mStart >= 0 ? matchBrace(code, mStart) : -1;
+            if (mStart < 0 || mEnd < 0) { m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(m.group())); continue; }
+            String method = code.substring(mStart, mEnd);
+            // VAR объявлена в методе НАСТОЯЩИМ образом? Наша прошлая заглушка
+            // «int VAR = 0; // [ApkTool] дефект jadx: пропущенное объявление»
+            // НЕ считается настоящим объявлением: она и создала мёртвый цикл,
+            // который мы сейчас чиним. Такую заглушку удалим и восстановим чтение.
+            String stubDecl = null;
+            java.util.regex.Matcher sd = java.util.regex.Pattern.compile(
+                    "(?m)^[ \\t]*(?:int|long|Integer)\\s+"
+                    + java.util.regex.Pattern.quote(var)
+                    + "\\s*=\\s*0;\\s*// \\[ApkTool\\] дефект jadx: пропущенное объявление[ \\t]*\\n?")
+                    .matcher(method);
+            if (sd.find()) stubDecl = sd.group();
+            boolean realDeclared = java.util.regex.Pattern.compile(
+                    "\\b(?:int|long|Integer)\\s+" + java.util.regex.Pattern.quote(var) + "\\b")
+                    .matcher(method).find() && stubDecl == null;
+            if (realDeclared) {
+                m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(m.group()));
+                continue;
+            }
+            // Ищем имя потока и буфера в методе.
+            String stream = findStreamVar(method);
+            String buf = findBufferVar(method);
+            if (stream == null || buf == null) {
+                m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(m.group()));
+                continue;
+            }
+            // Восстанавливаем присваивание в условии.
+            String fixed = "while ((" + var + " = " + stream + ".read(" + buf + ")) "
+                    + op + " " + lit + ") /* [ApkTool] восстановлено чтение потока (дефект jadx) */";
+            m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(fixed));
+            cnt[0]++;
+        }
+        m.appendTail(sb);
+        String out = sb.toString();
+        if (cnt[0] > 0) {
+            // Удаляем прошлые заглушки-пустышки «int VAR = 0; // …пропущенное
+            // объявление» — теперь VAR присваивается в условии, и объявление
+            // счётчика добавит declareReadCounters (иначе будет дубль/затенение).
+            out = out.replaceAll(
+                    "(?m)^[ \\t]*(?:int|long|Integer)\\s+[A-Za-z_$][\\w$]*"
+                    + "\\s*=\\s*0;\\s*// \\[ApkTool\\] дефект jadx: пропущенное объявление[ \\t]*\\n",
+                    "");
+            // Объявить int VAR перед восстановленными циклами (область видимости).
+            out = declareReadCounters(out);
+        }
+        return out;
+    }
+
+    /**
+     * Для каждого восстановленного цикла {@code while ((VAR = X.read(Y)) ...)}
+     * добавить перед ним {@code int VAR = 0;}, если VAR не объявлена в методе.
+     */
+    private String declareReadCounters(String code) {
+        String[] lines = code.split("\n", -1);
+        java.util.regex.Pattern condP = java.util.regex.Pattern.compile(
+                "while\\s*\\(\\(\\s*([A-Za-z_$][\\w$]*)\\s*=\\s*[\\w$.]+\\.read\\(");
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        for (String ln : lines) {
+            java.util.regex.Matcher cm = condP.matcher(ln);
+            if (cm.find()) {
+                String var = cm.group(1);
+                // Индентация строки while.
+                java.util.regex.Matcher im = java.util.regex.Pattern.compile("^(\\s*)").matcher(ln);
+                String ind = im.find() ? im.group(1) : "        ";
+                out.add(ind + "int " + var + " = 0; // [ApkTool] дефект jadx: объявление счётчика чтения");
+            }
+            out.add(ln);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < out.size(); i++) {
+            sb.append(out.get(i));
+            if (i < out.size() - 1) sb.append('\n');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Индекс '{' тела метода, охватывающего позицию pos. Идём назад до сигнатуры
+     * метода («…) {» или «…) throws … {») и возвращаем индекс её открывающей '{'.
+     */
+    private int methodBodyStart(String code, int pos) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\\)\\s*(?:throws [\\w., ]+)?\\{").matcher(code.substring(0, pos));
+        int last = -1;
+        while (m.find()) last = m.end() - 1; // индекс '{'
+        return last;
+    }
+
+    /**
+     * Имя переменной-потока в теле метода: объявлена типом, оканчивающимся на
+     * InputStream/Reader, ЛИБО получена из getAssets().open(...)/openRawResource
+     * (...)/new FileInputStream(...). Возвращает имя или null.
+     */
+    private String findStreamVar(String method) {
+        // 1) «Тип …Stream/Reader ИМЯ = …» или «ИМЯ = …open(…)/…read-источник».
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\\b([\\w.]*(?:InputStream|Reader))\\s+([A-Za-z_$][\\w$]*)\\s*=")
+                .matcher(method);
+        if (m.find()) return m.group(2);
+        // 2) «ИМЯ = <что-то>.open(…)» (AssetManager.open) или openRawResource(...).
+        m = java.util.regex.Pattern.compile(
+                "([A-Za-z_$][\\w$]*)\\s*=\\s*[\\w$.()\"]*\\.(?:open|openRawResource)\\(")
+                .matcher(method);
+        if (m.find()) return m.group(1);
+        return null;
+    }
+
+    /** Имя буфера (byte[]/char[]) в теле метода или null. */
+    private String findBufferVar(String method) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\\b(?:byte|char)\\s*\\[\\s*\\]\\s*([A-Za-z_$][\\w$]*)\\s*=")
+                .matcher(method);
+        if (m.find()) return m.group(1);
+        return null;
     }
 
     /**
